@@ -13,7 +13,9 @@ python3 gen_extractive_bp.py PAYLOAD_DIR [-o Android.bp] [options]
 
 Useful flags: `--name`, `--upstream`, `--apex-pkg`, `--prefix` (e.g. `ext-`
 for tree collisions), `--arch` (default `x86_64`), `--flat-srcs`,
-`--certificate` (default: `presigned`), `--no-availability`,
+`--certificate` (default: `presigned`), `-host` / `--host` (host-only
+package: forces `host_supported` + `device_supported: false` on code
+modules), `--no-availability`,
 `--no-prefer`, `--no-check-elf`, `--no-apex-available`, `--no-etc`.
 
 ## Mapping

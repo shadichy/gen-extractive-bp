@@ -17,6 +17,11 @@ apex/expat, apex/dmidecode), reusing the emitter conventions of
   etc/** (default on, --no-etc to skip)    -> prebuilt_etc (per file)
   *.apex                                   -> prebuilt_apex (full ext form)
 
+  -host / --host defines a host package: code modules (java_import,
+  cc_prebuilt_*, sh_binary, cc_library_headers) are forced to
+  host_supported: true + device_supported: false. Device-only modules
+  (prebuilt_apex, android_app_import, prebuilt_etc) are left untouched.
+
 REVIEW THE OUTPUT BEFORE USE:
   - .so symlink chains collapse to ONE module named after the shortest link
     name, srcs pointing at the real file (no versioned-.so precedent exists
@@ -134,6 +139,11 @@ def main():
                     help="plain top-level srcs instead of arch map (expat style)")
     ap.add_argument("--certificate", default=None,
                     help="android_app_import certificate (default: presigned)")
+    ap.add_argument("-host", "--host", dest="host", action="store_true",
+                    help="define host package: force host_supported: true + "
+                         "device_supported: false on code modules "
+                         "(java_import, cc_prebuilt_*, sh_binary, "
+                         "cc_library_headers)")
     ap.add_argument("--no-availability", action="store_true",
                     help="drop vendor/product/recovery/host_supported props")
     ap.add_argument("--no-prefer", action="store_true",
@@ -158,6 +168,16 @@ def main():
 
     def modname(base):
         return prefix + sanitize(base)
+
+    def with_host(props):
+        """--host: force host_supported + device_supported: false."""
+        if not args.host:
+            return props
+        out = [(k, v) for k, v in props
+               if k not in ("host_supported", "device_supported")]
+        out.append(("host_supported", True))
+        out.append(("device_supported", False))
+        return out
 
     # ---- walk ----
     files = []
@@ -301,7 +321,7 @@ def main():
 
     # ---- shared libs ----
     def shared_stanza(link_rel, target_rel):
-        props = list(avail) + check_elf
+        props = with_host(list(avail) + check_elf)
         stanza = ["cc_prebuilt_library_shared {",
                   "    name: %s,"
                   % q(unique(modname(soname_of(os.path.basename(link_rel)))))]
@@ -327,7 +347,7 @@ def main():
         lines = ["cc_prebuilt_library_static {",
                  "    name: %s,"
                  % q(unique(modname(soname_of(os.path.basename(rel)))))]
-        for key, val in avail:
+        for key, val in with_host(list(avail)):
             lines.append(prop(key, val))
         if args.flat_srcs:
             lines.append(prop("srcs", [rel]))
@@ -341,7 +361,7 @@ def main():
     # ---- jars (gen_extractive IMPORT_TEMPLATE + prefer) ----
     for rel in sorted(jars):
         base = os.path.basename(rel)
-        props = [("jars", [rel]), ("host_supported", True)]
+        props = with_host([("jars", [rel]), ("host_supported", True)])
         if not args.no_prefer:
             props.append(("prefer", True))
         stanzas.append(emit("java_import",
@@ -362,9 +382,9 @@ def main():
 
     # ---- binaries / scripts (dmidecode style) ----
     for rel in sorted(binaries):
-        props = (check_elf +
-                 [("srcs", [rel])] +
-                 ([] if args.no_prefer else [("prefer", True)]))
+        props = with_host(check_elf +
+                          [("srcs", [rel])] +
+                          ([] if args.no_prefer else [("prefer", True)]))
         stanzas.append(emit("cc_prebuilt_binary",
                             unique(modname(os.path.basename(rel))), props))
     for rel in sorted(scripts):
@@ -372,7 +392,7 @@ def main():
         base = re.sub(r"\.sh$", "", base)
         stanzas.append(emit("sh_binary",
                             unique(modname(base)),
-                            [("src", rel)]))
+                            with_host([("src", rel)])))
 
     # ---- headers, one <group>_headers module per dir group ----
     for group in sorted(header_groups):
@@ -383,7 +403,8 @@ def main():
                                              "//apex_available:platform"]))
         props.append(("export_include_dirs", dirs))
         stanzas.append(emit("cc_library_headers",
-                            unique(modname(group + "_headers")), props))
+                            unique(modname(group + "_headers")),
+                            with_host(props)))
 
     # ---- etc ----
     for rel in sorted(etcs):
