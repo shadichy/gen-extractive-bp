@@ -865,7 +865,8 @@ def generate_blueprint(payloaddir, args):
     cand_defaults = {k: v for k, v in cand_modules.items()
                      if v["type"].endswith("_defaults") and not v["has_srcs"]}
     for dname, ddata in sorted(cand_defaults.items()):
-        lines = ["%s {" % ddata["type"], "    name: %s," % q(modname(dname))]
+        d_type = "cc_defaults" if ddata["type"].endswith("cc_defaults") else ddata["type"]
+        lines = ["%s {" % d_type, "    name: %s," % q(modname(dname))]
         for line in ddata["raw_body"].splitlines():
             s = line.strip()
             if s.startswith("name:"):
