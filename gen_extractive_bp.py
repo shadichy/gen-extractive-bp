@@ -310,7 +310,7 @@ def parse_candidate_bp(cand_path):
             if inc_m:
                 inc_list = re.findall(r'"([^"]+)"', inc_m[0])
 
-            has_srcs = bool(re.search(r"\bsrcs\s*:", body)) or bool(re.search(r":\s*[a-zA-Z_]\w*\s*\+", body))
+            has_srcs = bool(re.search(r"\bsrcs\s*:", body)) or bool(re.search(r"\+\s*[a-zA-Z_]", body)) or bool(re.search(r":\s*[a-zA-Z_]\w*\s*\+", body))
 
             modules[mname] = {
                 "type": mtype,
