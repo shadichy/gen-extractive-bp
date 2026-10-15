@@ -234,12 +234,12 @@ def generate_blueprint(payloaddir, args):
     for fn in os.listdir(root):
         if fn.endswith(".apex"):
             stem = re.sub(r"\.apex$", "", fn, flags=re.IGNORECASE)
+            clean_apex_name = re.sub(r"-\d+$", "", stem)
             # Skip doc and dev packages for prebuilt_apex
-            if re.search(r"\.(dev|doc)$", stem, re.IGNORECASE):
+            if re.search(r"\.(dev|doc)$", clean_apex_name, re.IGNORECASE):
                 continue
             # Also check if it is extractive APEX (ext- or .ext.)
             is_extractive = bool(re.search(r"(^ext-|\.ext\.)", stem))
-            clean_apex_name = re.sub(r"-\d+$", "", stem)
             runtime_apexes.append({
                 "filename": fn,
                 "stem": stem,
@@ -251,13 +251,9 @@ def generate_blueprint(payloaddir, args):
     # Auto-extract runtime APEX payloads if requested or needed
     if not args.no_extract_apex:
         for ap in runtime_apexes:
-            # Decide extraction target directory: src/ or dev-src/ or root
-            if os.path.isdir(os.path.join(root, "src")):
-                ext_dir = os.path.join(root, "src")
-            elif os.path.isdir(os.path.join(root, "dev-src")):
-                ext_dir = os.path.join(root, "dev-src")
-            else:
-                ext_dir = os.path.join(root, "src")
+            # Runtime APEX payload components should be extracted into src/
+            ext_dir = os.path.join(root, "src")
+            os.makedirs(ext_dir, exist_ok=True)
             # Extract to temp, then merge lib/lib64/bin into ext_dir
             with tempfile.TemporaryDirectory() as tmp_stage:
                 if extract_apex_payload(ap["full_path"], tmp_stage):
@@ -269,12 +265,16 @@ def generate_blueprint(payloaddir, args):
                             for item in os.listdir(src_sub):
                                 s_item = os.path.join(src_sub, item)
                                 d_item = os.path.join(dest_sub, item)
-                                if not os.path.exists(d_item):
-                                    if os.path.islink(s_item):
-                                        linkto = os.readlink(s_item)
-                                        os.symlink(linkto, d_item)
-                                    elif os.path.isfile(s_item):
-                                        shutil.copy2(s_item, d_item)
+                                if os.path.lexists(d_item):
+                                    if os.path.islink(d_item) or os.path.isfile(d_item):
+                                        os.unlink(d_item)
+                                    elif os.path.isdir(d_item):
+                                        shutil.rmtree(d_item)
+                                if os.path.islink(s_item):
+                                    linkto = os.readlink(s_item)
+                                    os.symlink(linkto, d_item)
+                                elif os.path.isfile(s_item):
+                                    shutil.copy2(s_item, d_item)
 
     # ---- 2. Walk filesystem and classify files ----
     all_files = []
@@ -370,8 +370,14 @@ def generate_blueprint(payloaddir, args):
 
         if os.access(real_full, os.X_OK):
             if is_elf(real_full):
+                if is_dummy(base):
+                    continue
                 arch = elf_arch(real_full) or args.arch
-                binaries.setdefault(base, {}).setdefault(arch, []).append(rel)
+                canon_bin = re.sub(r"-x86_64(-v\d+)?$", "", base)
+                canon_bin = re.sub(r"-arm64(-v\d+)?$", "", canon_bin)
+                canon_bin = re.sub(r"-x86$", "", canon_bin)
+                canon_bin = re.sub(r"-arm$", "", canon_bin)
+                binaries.setdefault(canon_bin, {}).setdefault(arch, []).append(rel)
                 continue
             if is_script(real_full):
                 scripts.append(rel)
