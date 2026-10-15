@@ -188,7 +188,11 @@ def prop(key, val, indent="    "):
 
 def emit(modtype, name, props):
     lines = ["%s {" % modtype, "    name: %s," % q(name)]
+    seen_keys = set()
     for key, val in props:
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         rendered = prop(key, val)
         if rendered is not None:
             lines.append(rendered)
@@ -540,9 +544,12 @@ def generate_blueprint(payloaddir, args):
     elif not cand_modules and primary_inc_dir:
         # Fallback only when candidate BP was not provided
         abs_inc = os.path.join(root, primary_inc_dir)
-        base_pkg = raw_name
-        if base_pkg.startswith("prebuilts_target_"):
-            base_pkg = base_pkg[len("prebuilts_target_"):]
+        if args.upstream:
+            base_pkg = os.path.basename(args.upstream.rstrip("/"))
+        elif raw_name.startswith("prebuilts_target_"):
+            base_pkg = raw_name[len("prebuilts_target_"):]
+        else:
+            base_pkg = raw_name
         main_hdr_name = base_pkg + "_headers" if base_pkg.startswith("lib") else "lib" + base_pkg + "_headers"
         h_props = list(avail)
         if not args.no_apex_available:
@@ -604,6 +611,16 @@ def generate_blueprint(payloaddir, args):
                 props.append(("product_available", True))
             if cand_meta.get("recovery_available"):
                 props.append(("recovery_available", True))
+
+        # Deduplicate properties by key
+        dedup_props = []
+        seen = set()
+        for k, v in props:
+            if k in seen:
+                continue
+            seen.add(k)
+            dedup_props.append((k, v))
+        props = dedup_props
 
         # UNIFIED vs SHARED vs STATIC
         if sh and st:
