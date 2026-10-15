@@ -213,63 +213,124 @@ def emit_arch_srcs(srcs_by_arch, indent="    "):
     return lines
 
 
-def parse_candidate_bp(bp_path):
-    """Parse candidate Android.bp to extract module definitions and properties."""
-    if not bp_path or not os.path.isfile(bp_path):
-        return {}
-    try:
-        with open(bp_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-    except OSError:
-        return {}
+def extract_blocks(content):
+    blocks = []
+    i = 0
+    n = len(content)
+    while i < n:
+        m = re.search(r"(\w+)\s*\{", content[i:])
+        if not m:
+            break
+        modtype = m.group(1)
+        start_idx = i + m.end() - 1
+        depth = 0
+        j = start_idx
+        in_string = False
+        escape = False
+        while j < n:
+            ch = content[j]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+            else:
+                if ch == '"':
+                    in_string = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        body = content[start_idx+1:j]
+                        blocks.append((modtype, body.strip()))
+                        i = j + 1
+                        break
+            j += 1
+        else:
+            break
+    return blocks
 
-    # Strip comments without mangling string literals like "//apex_available:platform"
+
+def parse_candidate_bp(cand_path):
+    """Parse candidate Android.bp or tree directory to extract module definitions and defaults."""
+    if not cand_path:
+        return {}
+    bp_files = []
+    if os.path.isfile(cand_path):
+        bp_files = [cand_path]
+    elif os.path.isdir(cand_path):
+        root_bp = os.path.join(cand_path, "Android.bp")
+        if os.path.isfile(root_bp):
+            bp_files.append(root_bp)
+        for dp, _, fns in os.walk(cand_path):
+            for fn in sorted(fns):
+                if fn == "Android.bp":
+                    full_p = os.path.join(dp, fn)
+                    if full_p not in bp_files:
+                        bp_files.append(full_p)
+
     comment_pattern = re.compile(r'("(?:\\.|[^"\\])*")|//[^\r\n]*|/\*[\s\S]*?\*/')
-    content = comment_pattern.sub(lambda m: m.group(1) if m.group(1) else "", content)
-
-    mod_pattern = re.compile(r"(\w+)\s*\{([^}]+)\}", re.DOTALL)
     modules = {}
-    for mtype, body in mod_pattern.findall(content):
-        name_m = re.search(r"name:\s*\"([^\"]+)\"", body)
-        if not name_m:
+
+    for bp in bp_files:
+        try:
+            with open(bp, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+        except OSError:
             continue
-        mname = name_m.group(1)
 
-        apex_avail = re.findall(r"apex_available:\s*\[([^\]]*)\]", body)
-        avail_list = []
-        if apex_avail:
-            avail_list = re.findall(r'"([^"]+)"', apex_avail[0])
+        content = comment_pattern.sub(lambda m: m.group(1) if m.group(1) else "", content)
 
-        host_sup = bool(re.search(r"host_supported:\s*true", body))
-        vendor_av = bool(re.search(r"vendor_available:\s*true", body))
-        prod_av = bool(re.search(r"product_available:\s*true", body))
-        rec_av = bool(re.search(r"recovery_available:\s*true", body))
+        for mtype, body in extract_blocks(content):
+            name_m = re.search(r"name:\s*\"([^\"]+)\"", body)
+            if not name_m:
+                continue
+            mname = name_m.group(1)
+            if mname in modules:
+                continue
 
-        sdk_m = re.search(r"min_sdk_version:\s*\"([^\"]+)\"", body)
-        sdk_ver = sdk_m.group(1) if sdk_m else None
+            apex_avail = re.findall(r"apex_available:\s*\[([^\]]*)\]", body)
+            avail_list = []
+            if apex_avail:
+                avail_list = re.findall(r'"([^"]+)"', apex_avail[0])
 
-        inc_m = re.findall(r"export_include_dirs:\s*\[([^\]]*)\]", body)
-        inc_list = []
-        if inc_m:
-            inc_list = re.findall(r'"([^"]+)"', inc_m[0])
+            host_sup = bool(re.search(r"host_supported:\s*true", body))
+            vendor_av = bool(re.search(r"vendor_available:\s*true", body))
+            prod_av = bool(re.search(r"product_available:\s*true", body))
+            rec_av = bool(re.search(r"recovery_available:\s*true", body))
 
-        modules[mname] = {
-            "type": mtype,
-            "name": mname,
-            "apex_available": avail_list,
-            "host_supported": host_sup,
-            "vendor_available": vendor_av,
-            "product_available": prod_av,
-            "recovery_available": rec_av,
-            "min_sdk_version": sdk_ver,
-            "export_include_dirs": inc_list,
-        }
+            sdk_m = re.search(r"min_sdk_version:\s*\"([^\"]+)\"", body)
+            sdk_ver = sdk_m.group(1) if sdk_m else None
+
+            inc_m = re.findall(r"export_include_dirs:\s*\[([^\]]*)\]", body)
+            inc_list = []
+            if inc_m:
+                inc_list = re.findall(r'"([^"]+)"', inc_m[0])
+
+            has_srcs = bool(re.search(r"\bsrcs\s*:", body)) or bool(re.search(r":\s*[a-zA-Z_]\w*\s*\+", body))
+
+            modules[mname] = {
+                "type": mtype,
+                "name": mname,
+                "apex_available": avail_list,
+                "host_supported": host_sup,
+                "vendor_available": vendor_av,
+                "product_available": prod_av,
+                "recovery_available": rec_av,
+                "min_sdk_version": sdk_ver,
+                "export_include_dirs": inc_list,
+                "has_srcs": has_srcs,
+                "raw_body": body,
+            }
     return modules
 
 
 def find_candidate_bp(args, root):
     """Locate candidate Android.bp in the platform source tree."""
-    if args.candidate_bp and os.path.isfile(args.candidate_bp):
+    if args.candidate_bp and (os.path.isfile(args.candidate_bp) or os.path.isdir(args.candidate_bp)):
         return args.candidate_bp
 
     tree_candidates = []
@@ -292,19 +353,28 @@ def find_candidate_bp(args, root):
 
     if upstream:
         for t in tree_candidates:
-            # Check upstream directly
+            # Check upstream directly (file or directory)
             cand = os.path.join(t, upstream, "Android.bp")
             if os.path.isfile(cand):
                 return cand
+            cand_dir = os.path.join(t, upstream)
+            if os.path.isdir(cand_dir):
+                return cand_dir
             # Check alternative upstream prefix (e.g. hardware/libchrome vs external/libchrome)
             if upstream.startswith("hardware/"):
                 alt = os.path.join(t, "external", upstream[len("hardware/"):], "Android.bp")
                 if os.path.isfile(alt):
                     return alt
+                alt_dir = os.path.join(t, "external", upstream[len("hardware/"):])
+                if os.path.isdir(alt_dir):
+                    return alt_dir
             elif upstream.startswith("external/"):
                 alt = os.path.join(t, "hardware", upstream[len("external/"):], "Android.bp")
                 if os.path.isfile(alt):
                     return alt
+                alt_dir = os.path.join(t, "hardware", upstream[len("external/"):])
+                if os.path.isdir(alt_dir):
+                    return alt_dir
     return None
 
 
@@ -570,13 +640,18 @@ def generate_blueprint(payloaddir, args):
     def resolve_prebuilt_lib(query_name):
         if query_name in lib_map:
             return query_name, lib_map[query_name]
-        # Try stripping suffixes: -cpp-full, -cpp-lite, -cpp, _static
-        c1 = query_name.replace("-cpp-full", "").replace("-cpp-lite", "-lite").replace("-cpp", "")
-        if c1 in lib_map:
-            return c1, lib_map[c1]
-        c2 = re.sub(r"_static$", "", query_name)
-        if c2 in lib_map:
-            return c2, lib_map[c2]
+        # Try stripping suffixes: -cpp-full, -cpp-lite, -cpp, _static, -impl-internal, -internal, -impl
+        c = query_name.replace("-cpp-full", "").replace("-cpp-lite", "-lite").replace("-cpp", "")
+        for sfx in ["-impl-internal", "-internal", "-impl", "_static", "-static", "_shared", "-shared"]:
+            if c.endswith(sfx):
+                c = c[:-len(sfx)]
+                break
+        if c in lib_map:
+            return c, lib_map[c]
+        if ("lib" + c) in lib_map:
+            return ("lib" + c), lib_map["lib" + c]
+        if c.startswith("lib") and c[3:] in lib_map:
+            return c[3:], lib_map[c[3:]]
         return None, None
 
     # Emit libraries aligned with candidate modules
@@ -622,8 +697,39 @@ def generate_blueprint(payloaddir, args):
             dedup_props.append((k, v))
         props = dedup_props
 
-        # UNIFIED vs SHARED vs STATIC
-        if sh and st:
+        # Determine target mode based on candidate type
+        cand_type = cand_meta.get("type", "") if cand_meta else ""
+        force_static = (cand_type in ("cc_library_static", "cc_prebuilt_library_static") or
+                        target_name.endswith("_static") or "-impl-internal" in target_name)
+        force_shared = (cand_type in ("cc_library_shared", "cc_prebuilt_library_shared"))
+
+        if force_static and (st or sh):
+            lines = ["cc_prebuilt_library_static {", "    name: %s," % q(modname(target_name))]
+            for k, v in props:
+                rendered = prop(k, v)
+                if rendered:
+                    lines.append(rendered)
+            st_src = best_src(st if st else sh)
+            if args.flat_srcs or len(st_src) == 1 and args.arch in st_src:
+                lines.append("    srcs: [%s]," % q(st_src[args.arch][0]))
+            else:
+                lines.extend(emit_arch_srcs(st_src))
+            lines.append("}")
+            stanzas.append("\n".join(lines))
+        elif force_shared and (sh or st):
+            lines = ["cc_prebuilt_library_shared {", "    name: %s," % q(modname(target_name))]
+            for k, v in props:
+                rendered = prop(k, v)
+                if rendered:
+                    lines.append(rendered)
+            sh_src = best_src(sh if sh else st)
+            if args.flat_srcs or len(sh_src) == 1 and args.arch in sh_src:
+                lines.append("    srcs: [%s]," % q(sh_src[args.arch][0]))
+            else:
+                lines.extend(emit_arch_srcs(sh_src))
+            lines.append("}")
+            stanzas.append("\n".join(lines))
+        elif sh and st:
             lines = ["cc_prebuilt_library {", "    name: %s," % q(modname(target_name))]
             for k, v in props:
                 rendered = prop(k, v)
@@ -754,6 +860,20 @@ def generate_blueprint(payloaddir, args):
         lines.append("}")
         stanzas.append("\n".join(lines))
         emitted_bins.add(base)
+
+    # Candidate Defaults (preserve essential interface defaults without sources)
+    cand_defaults = {k: v for k, v in cand_modules.items()
+                     if v["type"].endswith("_defaults") and not v["has_srcs"]}
+    for dname, ddata in sorted(cand_defaults.items()):
+        lines = ["%s {" % ddata["type"], "    name: %s," % q(modname(dname))]
+        for line in ddata["raw_body"].splitlines():
+            s = line.strip()
+            if s.startswith("name:"):
+                continue
+            if s:
+                lines.append("    " + s)
+        lines.append("}")
+        stanzas.append("\n".join(lines))
 
     # Scripts (Deduplicated by base name, preferring src/)
     seen_scripts = set()
