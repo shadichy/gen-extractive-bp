@@ -1,18 +1,23 @@
 #!/usr/bin/env python3
-"""Generate an extractive APEX payload Android.bp by scanning a staging dir.
+"""gen_extractive_bp.py
 
-Enhanced to:
-1. Inspect co-located standard/runtime APEX packages, extract their payloads
-   (lib/ and lib64/ shared libraries) to stage alongside dev/static archives.
-2. Filter out internal APEX artifacts: _libdummy*, libdummy_*, linker.config.json.
-3. Emit prebuilt_apex strictly for runtime APEXes (stripping version numbers,
-   ignoring .dev.apex and .doc.apex).
-4. Combine matching shared .so and static .a into unified cc_prebuilt_library,
-   attaching export_include_dirs automatically.
-5. Intelligently discover include directories (at root, src/include, dev-src/include)
-   and generate well-known <pkg>_headers and subfolder headers without mangling
-   to 'src_headers' or 'dev_src_headers'.
-6. Clean Maven coordinates on JAR files to standard AOSP java_import module names.
+Extracts APEX payloads and generates clean, precise Android.bp blueprints for
+prebuilt and extractive APEX shadow repositories.
+
+Key capabilities:
+1. Auto-extracts co-located standard and extractive APEX payloads
+   (lib/, lib64/, bin/, share/) to stage alongside dev/static archives.
+2. Filters out internal APEX artifacts: _libdummy*, libdummy_*, linker.config.json.
+3. Candidate Alignment: When replacing an in-tree component, inspects the candidate
+   Android.bp to ensure the generated blueprint provides EXACTLY what the replaced
+   candidate provided (e.g. 'libcrypto' for boringssl, 'libprotobuf-cpp-full' /
+   'libprotobuf-cpp-lite' / 'aprotoc' for protobuf, 'libchrome' for libchrome).
+4. Emits unified cc_prebuilt_library combining matching shared .so and static .a,
+   attaching candidate apex_available, min_sdk_version, and export_include_dirs.
+5. Intelligently discovers include directories (at root, src/include, dev-src/include)
+   and emits candidate-matched header modules without inventing colliding names.
+6. Cleans Maven coordinates on JAR files to standard AOSP java_import module names,
+   grouping multi-artifact jars cleanly under a single java_import stanza.
 """
 import argparse
 import os
@@ -108,10 +113,8 @@ def canonical_libname(filename, real_path=None):
                 return sn_clean
 
     base = os.path.basename(filename)
-    # Strip extensions
     name = re.sub(r"\.so(\..*)?$", "", base)
     name = re.sub(r"\.a$", "", name)
-    # Strip microarch suffixes (-x86_64-v2, -x86_64)
     name = re.sub(r"-x86_64(-v\d+)?$", "", name)
     name = re.sub(r"-arm64(-v\d+)?$", "", name)
     name = re.sub(r"-x86$", "", name)
@@ -128,15 +131,14 @@ def clean_jar_name(rel_path):
         idx = parts.index("share")
         if len(parts) > idx + 1:
             folder = parts[idx + 1]
-    
+
     # Strip group__
     artifact = re.sub(r"^[a-zA-Z0-9_\.\-]+__", "", base)
     # Strip version suffix
     artifact = re.sub(r"-(\d+(\.\d+)*.*)\.jar$", "", artifact)
     artifact = re.sub(r"\.jar$", "", artifact)
-    
+
     if folder and folder != "share":
-        # If folder has distinctive name (e.g. guava-both, guava-jre, guava-android-annotation-stubs)
         if folder.startswith(artifact + "-") or folder != artifact:
             if not (artifact != "guava" and folder == "guava"):
                 return folder
@@ -207,6 +209,101 @@ def emit_arch_srcs(srcs_by_arch, indent="    "):
     return lines
 
 
+def parse_candidate_bp(bp_path):
+    """Parse candidate Android.bp to extract module definitions and properties."""
+    if not bp_path or not os.path.isfile(bp_path):
+        return {}
+    try:
+        with open(bp_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except OSError:
+        return {}
+
+    # Strip comments without mangling string literals like "//apex_available:platform"
+    comment_pattern = re.compile(r'("(?:\\.|[^"\\])*")|//[^\r\n]*|/\*[\s\S]*?\*/')
+    content = comment_pattern.sub(lambda m: m.group(1) if m.group(1) else "", content)
+
+    mod_pattern = re.compile(r"(\w+)\s*\{([^}]+)\}", re.DOTALL)
+    modules = {}
+    for mtype, body in mod_pattern.findall(content):
+        name_m = re.search(r"name:\s*\"([^\"]+)\"", body)
+        if not name_m:
+            continue
+        mname = name_m.group(1)
+
+        apex_avail = re.findall(r"apex_available:\s*\[([^\]]*)\]", body)
+        avail_list = []
+        if apex_avail:
+            avail_list = re.findall(r'"([^"]+)"', apex_avail[0])
+
+        host_sup = bool(re.search(r"host_supported:\s*true", body))
+        vendor_av = bool(re.search(r"vendor_available:\s*true", body))
+        prod_av = bool(re.search(r"product_available:\s*true", body))
+        rec_av = bool(re.search(r"recovery_available:\s*true", body))
+
+        sdk_m = re.search(r"min_sdk_version:\s*\"([^\"]+)\"", body)
+        sdk_ver = sdk_m.group(1) if sdk_m else None
+
+        inc_m = re.findall(r"export_include_dirs:\s*\[([^\]]*)\]", body)
+        inc_list = []
+        if inc_m:
+            inc_list = re.findall(r'"([^"]+)"', inc_m[0])
+
+        modules[mname] = {
+            "type": mtype,
+            "name": mname,
+            "apex_available": avail_list,
+            "host_supported": host_sup,
+            "vendor_available": vendor_av,
+            "product_available": prod_av,
+            "recovery_available": rec_av,
+            "min_sdk_version": sdk_ver,
+            "export_include_dirs": inc_list,
+        }
+    return modules
+
+
+def find_candidate_bp(args, root):
+    """Locate candidate Android.bp in the platform source tree."""
+    if args.candidate_bp and os.path.isfile(args.candidate_bp):
+        return args.candidate_bp
+
+    tree_candidates = []
+    if args.tree_root:
+        tree_candidates.append(args.tree_root)
+    if "ANDROID_BUILD_TOP" in os.environ:
+        tree_candidates.append(os.environ["ANDROID_BUILD_TOP"])
+    tree_candidates.append("/home/shadichy/Documents/bliss/los-21")
+
+    upstream = args.upstream
+    if not upstream and os.path.isfile(os.path.join(root, "SHADOW.txt")):
+        try:
+            with open(os.path.join(root, "SHADOW.txt")) as f:
+                for line in f:
+                    if "upstream:" in line:
+                        upstream = line.split("upstream:")[1].strip()
+                        break
+        except OSError:
+            pass
+
+    if upstream:
+        for t in tree_candidates:
+            # Check upstream directly
+            cand = os.path.join(t, upstream, "Android.bp")
+            if os.path.isfile(cand):
+                return cand
+            # Check alternative upstream prefix (e.g. hardware/libchrome vs external/libchrome)
+            if upstream.startswith("hardware/"):
+                alt = os.path.join(t, "external", upstream[len("hardware/"):], "Android.bp")
+                if os.path.isfile(alt):
+                    return alt
+            elif upstream.startswith("external/"):
+                alt = os.path.join(t, "hardware", upstream[len("external/"):], "Android.bp")
+                if os.path.isfile(alt):
+                    return alt
+    return None
+
+
 def generate_blueprint(payloaddir, args):
     root = os.path.abspath(payloaddir)
     if not os.path.isdir(root):
@@ -217,6 +314,10 @@ def generate_blueprint(payloaddir, args):
     prefix = args.prefix
     avail = [] if args.no_availability else [(k, True) for k in AVAIL]
     check_elf = [] if args.no_check_elf else [("check_elf_files", False)]
+
+    # Load candidate modules from original candidate Android.bp if available
+    cand_bp_path = find_candidate_bp(args, root)
+    cand_modules = parse_candidate_bp(cand_bp_path) if cand_bp_path else {}
 
     def modname(base):
         return prefix + base
@@ -254,10 +355,10 @@ def generate_blueprint(payloaddir, args):
             # Runtime APEX payload components should be extracted into src/
             ext_dir = os.path.join(root, "src")
             os.makedirs(ext_dir, exist_ok=True)
-            # Extract to temp, then merge lib/lib64/bin into ext_dir
+            # Extract to temp, then merge lib/lib64/bin/share into ext_dir
             with tempfile.TemporaryDirectory() as tmp_stage:
                 if extract_apex_payload(ap["full_path"], tmp_stage):
-                    for sub in ["lib", "lib64", "bin"]:
+                    for sub in ["lib", "lib64", "bin", "share"]:
                         src_sub = os.path.join(tmp_stage, sub)
                         if os.path.isdir(src_sub):
                             dest_sub = os.path.join(ext_dir, sub)
@@ -273,6 +374,8 @@ def generate_blueprint(payloaddir, args):
                                 if os.path.islink(s_item):
                                     linkto = os.readlink(s_item)
                                     os.symlink(linkto, d_item)
+                                elif os.path.isdir(s_item):
+                                    shutil.copytree(s_item, d_item, symlinks=True)
                                 elif os.path.isfile(s_item):
                                     shutil.copy2(s_item, d_item)
 
@@ -304,7 +407,6 @@ def generate_blueprint(payloaddir, args):
         base = os.path.basename(rel)
         if base.endswith(HEADER_EXTS):
             header_files.append((rel, full))
-            # Find the "include" directory component
             parts = rel.split(os.sep)
             if "include" in parts:
                 idx = parts.index("include")
@@ -349,7 +451,6 @@ def generate_blueprint(payloaddir, args):
             canon = canonical_libname(rel, real_full)
             if is_dummy(canon):
                 continue
-            # Prefer canonical names starting with lib
             if not canon.startswith("lib") and ("lib" + canon) in lib_map:
                 canon = "lib" + canon
             entry = lib_map.setdefault(canon, {"shared": {}, "static": {}})
@@ -390,39 +491,17 @@ def generate_blueprint(payloaddir, args):
     if args.upstream:
         hdr = ("// Auto-generated prebuilt Blueprint for %s\n" % args.upstream)
     else:
-        hdr = ("// Auto-generated prebuilt Blueprint for %s\n" % raw_name)
-    if args.apex_pkg:
-        hdr += ("// Extracted from Extractive APEX package: %s\n" % args.apex_pkg)
-    hdr += ("// Generated by tools/gen_extractive_bp.py - REVIEW BEFORE USE\n\n")
+        hdr = ("// Auto-generated prebuilt Blueprint for %s\n" % name)
+    hdr += "// Generated by tools/gen_extractive_bp.py - REVIEW BEFORE USE\n\n"
+    hdr += "package {\n    default_applicable_licenses: [%s],\n}\n" % q(args.license)
 
-    notice = os.path.isfile(os.path.join(root, "NOTICE"))
-    if notice:
-        lic_name = sanitize(name + "_license")
-        hdr += ("package {\n"
-                "    default_applicable_licenses: [%s],\n"
-                "}\n\n"
-                "license {\n"
-                "    name: %s,\n"
-                "    visibility: [\":__subpackages__\"],\n"
-                "    license_kinds: [\n"
-                "        \"SPDX-license-identifier-Apache-2.0\",\n"
-                "    ],\n"
-                "    license_text: [\n"
-                "        \"NOTICE\",\n"
-                "    ],\n"
-                "}\n" % (q(lic_name), q(lic_name)))
-    else:
-        hdr += ("package {\n"
-                "    default_applicable_licenses: [%s],\n"
-                "}\n" % q(args.license))
-
-    # prebuilt_apex (strictly for runtime APEXes)
+    # Runtime prebuilt_apex
     for ap in runtime_apexes:
         if ap["is_extractive"] and not args.emit_extractive_prebuilt_apex:
             continue
         lines = [
             "prebuilt_apex {",
-            "    name: %s," % q(modname(ap["apex_name"])),
+            "    name: %s," % q(ap["apex_name"]),
             "    apex_name: %s," % q(ap["apex_name"]),
             "    source_apex_name: %s," % q(ap["apex_name"]),
             "    arch: {",
@@ -431,28 +510,40 @@ def generate_blueprint(payloaddir, args):
             "        },",
             "    },",
             "    filename: %s," % q(ap["filename"]),
+            "    prefer: true,",
+            "    installable: true,",
+            "}",
         ]
-        if not args.no_prefer:
-            lines.append("    prefer: true,")
-        lines.append("    installable: true,")
-        lines.append("}")
         stanzas.append("\n".join(lines))
 
-    # Header modules
-    # If subdirectories exist in include_dir, emit header modules for them
-    emitted_headers = set()
-    if primary_inc_dir:
-        abs_inc = os.path.join(root, primary_inc_dir)
-        subdirs = [d for d in sorted(os.listdir(abs_inc))
-                   if os.path.isdir(os.path.join(abs_inc, d)) and not d.startswith(".")]
-        
-        # Primary package header module: <pkg>_headers (or lib<pkg>_headers)
-        base_pkg = raw_name
-        if base_pkg.startswith("lib"):
-            main_hdr_name = base_pkg + "_headers"
-        else:
-            main_hdr_name = "lib" + base_pkg + "_headers"
+    # Candidate classification maps
+    cand_cc_libs = {k: v for k, v in cand_modules.items()
+                    if v["type"].startswith("cc_library") or v["type"].startswith("cc_prebuilt_library")}
+    cand_binaries = {k: v for k, v in cand_modules.items()
+                     if v["type"].startswith("cc_binary") or v["type"] == "cc_prebuilt_binary"}
+    cand_headers = {k: v for k, v in cand_modules.items()
+                    if v["type"] == "cc_library_headers"}
 
+    # Header modules:
+    # If candidate Android.bp exists, only emit headers defined by candidate
+    # Otherwise, emit canonical <pkg>_headers if primary_inc_dir exists
+    emitted_headers = set()
+    if cand_headers:
+        for ch_name, ch_data in sorted(cand_headers.items()):
+            h_props = list(avail)
+            apex_av = ch_data["apex_available"] or ["//apex_available:anyapex", "//apex_available:platform"]
+            h_props.append(("apex_available", apex_av))
+            if primary_inc_dir:
+                h_props.append(("export_include_dirs", [primary_inc_dir]))
+            stanzas.append(emit("cc_library_headers", modname(ch_name), with_host(h_props)))
+            emitted_headers.add(ch_name)
+    elif not cand_modules and primary_inc_dir:
+        # Fallback only when candidate BP was not provided
+        abs_inc = os.path.join(root, primary_inc_dir)
+        base_pkg = raw_name
+        if base_pkg.startswith("prebuilts_target_"):
+            base_pkg = base_pkg[len("prebuilts_target_"):]
+        main_hdr_name = base_pkg + "_headers" if base_pkg.startswith("lib") else "lib" + base_pkg + "_headers"
         h_props = list(avail)
         if not args.no_apex_available:
             h_props.append(("apex_available", ["//apex_available:anyapex", "//apex_available:platform"]))
@@ -460,51 +551,67 @@ def generate_blueprint(payloaddir, args):
         stanzas.append(emit("cc_library_headers", modname(main_hdr_name), with_host(h_props)))
         emitted_headers.add(main_hdr_name)
 
-        for sd in subdirs:
-            # Only emit subfolder headers if it matches a library in this package
-            # (prevents libchrome from emitting conflicting libbase_headers)
-            cand1 = sd if sd.startswith("lib") else "lib" + sd
-            cand2 = sd
-            if cand1 in lib_map or cand2 in lib_map or base_pkg == "core" or base_pkg == "system_core":
-                if sd in ("private", "android"):
-                    sub_hdr_name = f"{base_pkg}_{sd}_headers"
-                elif not sd.startswith("lib"):
-                    sub_hdr_name = f"lib{sd}_headers"
-                else:
-                    sub_hdr_name = f"{sd}_headers"
-                if sub_hdr_name not in emitted_headers:
-                    stanzas.append(emit("cc_library_headers", modname(sub_hdr_name), with_host(h_props)))
-                    emitted_headers.add(sub_hdr_name)
+    # Helper to choose cleanest source path for given arch
+    def best_src(arch_map):
+        out = {}
+        for a, paths in arch_map.items():
+            p_clean = sorted(paths, key=lambda p: (len(p), p))[0]
+            out[a] = [p_clean]
+        return out
 
-    # Libraries (cc_prebuilt_library / shared / static)
-    for libname, data in sorted(lib_map.items()):
-        sh = data["shared"]
-        st = data["static"]
+    # Helper to find prebuilt data matching a library name
+    def resolve_prebuilt_lib(query_name):
+        if query_name in lib_map:
+            return query_name, lib_map[query_name]
+        # Try stripping suffixes: -cpp-full, -cpp-lite, -cpp, _static
+        c1 = query_name.replace("-cpp-full", "").replace("-cpp-lite", "-lite").replace("-cpp", "")
+        if c1 in lib_map:
+            return c1, lib_map[c1]
+        c2 = re.sub(r"_static$", "", query_name)
+        if c2 in lib_map:
+            return c2, lib_map[c2]
+        return None, None
+
+    # Emit libraries aligned with candidate modules
+    emitted_lib_targets = set()
+
+    def emit_library_module(target_name, data, cand_meta=None):
+        sh = data.get("shared", {})
+        st = data.get("static", {})
         props = with_host(list(avail) + check_elf)
         if primary_inc_dir:
             props.append(("export_include_dirs", [primary_inc_dir]))
         if not args.no_prefer:
             props.append(("prefer", True))
-        if not args.no_apex_available:
+
+        # Apex available
+        if cand_meta and cand_meta.get("apex_available"):
+            props.append(("apex_available", cand_meta["apex_available"]))
+        elif not args.no_apex_available:
             props.append(("apex_available", ["//apex_available:anyapex", "//apex_available:platform"]))
 
-        def best_src(arch_map):
-            # Choose cleanest source path for given arch
-            # Prefer unversioned real path
-            out = {}
-            for a, paths in arch_map.items():
-                p_clean = sorted(paths, key=lambda p: (len(p), p))[0]
-                out[a] = [p_clean]
-            return out
+        # Min SDK version
+        if cand_meta and cand_meta.get("min_sdk_version"):
+            props.append(("min_sdk_version", cand_meta["min_sdk_version"]))
+        else:
+            props.append(("min_sdk_version", "29"))
 
+        # Vendor / product availability from candidate
+        if cand_meta:
+            if cand_meta.get("vendor_available"):
+                props.append(("vendor_available", True))
+            if cand_meta.get("product_available"):
+                props.append(("product_available", True))
+            if cand_meta.get("recovery_available"):
+                props.append(("recovery_available", True))
+
+        # UNIFIED vs SHARED vs STATIC
         if sh and st:
-            # UNIFIED cc_prebuilt_library
-            lines = ["cc_prebuilt_library {", "    name: %s," % q(modname(libname))]
+            lines = ["cc_prebuilt_library {", "    name: %s," % q(modname(target_name))]
             for k, v in props:
                 rendered = prop(k, v)
                 if rendered:
                     lines.append(rendered)
-            # shared stanza
             sh_src = best_src(sh)
             lines.append("    shared: {")
             if args.flat_srcs or len(sh_src) == 1 and args.arch in sh_src:
@@ -512,7 +619,6 @@ def generate_blueprint(payloaddir, args):
             else:
                 lines.extend(emit_arch_srcs(sh_src, indent="        "))
             lines.append("    },")
-            # static stanza
             st_src = best_src(st)
             lines.append("    static: {")
             if args.flat_srcs or len(st_src) == 1 and args.arch in st_src:
@@ -523,8 +629,7 @@ def generate_blueprint(payloaddir, args):
             lines.append("}")
             stanzas.append("\n".join(lines))
         elif sh:
-            # Shared only
-            lines = ["cc_prebuilt_library_shared {", "    name: %s," % q(modname(libname))]
+            lines = ["cc_prebuilt_library_shared {", "    name: %s," % q(modname(target_name))]
             for k, v in props:
                 rendered = prop(k, v)
                 if rendered:
@@ -537,8 +642,7 @@ def generate_blueprint(payloaddir, args):
             lines.append("}")
             stanzas.append("\n".join(lines))
         elif st:
-            # Static only
-            lines = ["cc_prebuilt_library_static {", "    name: %s," % q(modname(libname))]
+            lines = ["cc_prebuilt_library_static {", "    name: %s," % q(modname(target_name))]
             for k, v in props:
                 rendered = prop(k, v)
                 if rendered:
@@ -551,17 +655,29 @@ def generate_blueprint(payloaddir, args):
             lines.append("}")
             stanzas.append("\n".join(lines))
 
-    # Java imports (Clean Maven naming)
-    used_jar_names = set()
+    # Match candidate libraries first
+    matched_prebuilts = set()
+    for cand_name, cand_data in sorted(cand_cc_libs.items()):
+        matched_key, pdata = resolve_prebuilt_lib(cand_name)
+        if pdata:
+            emit_library_module(cand_name, pdata, cand_data)
+            emitted_lib_targets.add(cand_name)
+            matched_prebuilts.add(matched_key)
+
+    # Emit remaining prebuilt libraries
+    for libname, data in sorted(lib_map.items()):
+        if libname not in emitted_lib_targets:
+            emit_library_module(libname, data)
+            emitted_lib_targets.add(libname)
+
+    # Java imports (Clean Maven naming, grouped by module name)
+    jars_by_name = {}
     for rel in sorted(jars):
         clean_name = clean_jar_name(rel)
-        mod_name = clean_name
-        idx = 2
-        while mod_name in used_jar_names:
-            mod_name = f"{clean_name}_{idx}"
-            idx += 1
-        used_jar_names.add(mod_name)
-        props = with_host([("jars", [rel]), ("host_supported", True)])
+        jars_by_name.setdefault(clean_name, []).append(rel)
+
+    for mod_name, jar_list in sorted(jars_by_name.items()):
+        props = with_host([("jars", sorted(jar_list)), ("host_supported", True)])
         if not args.no_prefer:
             props.append(("prefer", True))
         stanzas.append(emit("java_import", modname(mod_name), props))
@@ -577,8 +693,37 @@ def generate_blueprint(payloaddir, args):
             props.append(("presigned", True))
         stanzas.append(emit("android_app_import", modname(clean_name), props))
 
-    # Binaries & Scripts
+    # Helper to resolve prebuilt binary
+    def resolve_prebuilt_bin(query_name):
+        if query_name in binaries:
+            return query_name, binaries[query_name]
+        if query_name.startswith("a") and query_name[1:] in binaries:
+            return query_name[1:], binaries[query_name[1:]]
+        return None, None
+
+    # Binaries (Aligned with candidate modules)
+    emitted_bins = set()
+    for cand_name, cand_data in sorted(cand_binaries.items()):
+        matched_key, arch_srcs = resolve_prebuilt_bin(cand_name)
+        if arch_srcs:
+            props = with_host(check_elf + ([] if args.no_prefer else [("prefer", True)]))
+            lines = ["cc_prebuilt_binary {", "    name: %s," % q(modname(cand_name))]
+            for k, v in props:
+                rendered = prop(k, v)
+                if rendered:
+                    lines.append(rendered)
+            if args.flat_srcs or len(arch_srcs) == 1 and args.arch in arch_srcs:
+                lines.append("    srcs: [%s]," % q(arch_srcs[args.arch][0]))
+            else:
+                lines.extend(emit_arch_srcs(arch_srcs))
+            lines.append("}")
+            stanzas.append("\n".join(lines))
+            emitted_bins.add(cand_name)
+            emitted_bins.add(matched_key)
+
     for base, arch_srcs in sorted(binaries.items()):
+        if base in emitted_bins:
+            continue
         props = with_host(check_elf + ([] if args.no_prefer else [("prefer", True)]))
         lines = ["cc_prebuilt_binary {", "    name: %s," % q(modname(base))]
         for k, v in props:
@@ -591,12 +736,18 @@ def generate_blueprint(payloaddir, args):
             lines.extend(emit_arch_srcs(arch_srcs))
         lines.append("}")
         stanzas.append("\n".join(lines))
+        emitted_bins.add(base)
 
-    for rel in sorted(scripts):
+    # Scripts (Deduplicated by base name, preferring src/)
+    seen_scripts = set()
+    for rel in sorted(scripts, key=lambda s: (0 if s.startswith("src/") else 1, s)):
         base = re.sub(r"\.sh$", "", os.path.basename(rel))
+        if base in seen_scripts:
+            continue
+        seen_scripts.add(base)
         stanzas.append(emit("sh_binary", modname(base), with_host([("src", rel)])))
 
-    # etc
+    # etc (Excluding linker.config.json)
     for rel in sorted(etcs):
         sub = os.path.dirname(os.path.relpath(rel, "etc"))
         props = [("src", rel)]
@@ -621,6 +772,10 @@ def main():
     ap.add_argument("-o", "--output", default="-")
     ap.add_argument("--name", default=None)
     ap.add_argument("--upstream", default=None)
+    ap.add_argument("--candidate-bp", default=None,
+                    help="path to original candidate Android.bp to match module names and properties")
+    ap.add_argument("--tree-root", default=None,
+                    help="path to platform source tree root")
     ap.add_argument("--apex-pkg", default=None)
     ap.add_argument("--prefix", default="")
     ap.add_argument("--license", default="Android-Apache-2.0")
